@@ -423,10 +423,7 @@ pub fn now() -> Tm {
 impl Tm {
     /// Convert time to the seconds from January 1, 1970
     pub fn to_timespec(&self) -> Timespec {
-        let sec = match self.tm_utcoff {
-            0 => sys::utc_tm_to_time(self),
-            _ => sys::local_tm_to_time(self)
-        };
+        let sec = sys::utc_tm_to_time(self) - (self.tm_utcoff as i64);
 
         Timespec::new(sec, self.tm_nsec)
     }

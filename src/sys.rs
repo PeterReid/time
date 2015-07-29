@@ -325,6 +325,39 @@ mod inner {
     use kernel32::*;
     use winapi::*;
 
+    extern {
+        fn _localtime64_s(_tm: *mut tm,time: *const i64) -> c_int;
+        fn _mkgmtime64(_tm: *const tm) -> i64;
+        fn _gmtime64_s( _tm: *mut tm, time: *const i64) -> c_int;
+    }
+
+    /// Window's `tm`
+    #[repr(C)]
+    struct tm {
+        tm_sec: c_int,
+        tm_min: c_int,
+        tm_hour: c_int,
+        tm_mday: c_int,
+        tm_mon: c_int,
+        tm_year: c_int,
+        tm_wday: c_int,
+        tm_yday: c_int,
+        tm_isdst: c_int,
+    }
+
+    fn tm_to_rust_tm(tm: &tm, utcoff: i32, rust_tm: &mut Tm) {
+        rust_tm.tm_sec = tm.tm_sec;
+        rust_tm.tm_min = tm.tm_min;
+        rust_tm.tm_hour = tm.tm_hour;
+        rust_tm.tm_mday = tm.tm_mday;
+        rust_tm.tm_mon = tm.tm_mon;
+        rust_tm.tm_year = tm.tm_year;
+        rust_tm.tm_wday = tm.tm_wday;
+        rust_tm.tm_yday = tm.tm_yday;
+        rust_tm.tm_isdst = tm.tm_isdst;
+        rust_tm.tm_utcoff = utcoff;
+    }
+
     fn frequency() -> LARGE_INTEGER {
         static mut FREQUENCY: LARGE_INTEGER = 0;
         static ONCE: Once = ONCE_INIT;
@@ -339,14 +372,6 @@ mod inner {
 
     const HECTONANOSECS_IN_SEC: u64 = 10_000_000;
     const HECTONANOSEC_TO_UNIX_EPOCH: u64 = 11_644_473_600 * HECTONANOSECS_IN_SEC;
-
-    fn time_to_file_time(sec: i64) -> FILETIME {
-        let t = (sec as u64 * HECTONANOSECS_IN_SEC) + HECTONANOSEC_TO_UNIX_EPOCH;
-        FILETIME {
-            dwLowDateTime: t as DWORD,
-            dwHighDateTime: (t >> 32) as DWORD
-        }
-    }
 
     fn file_time_to_nsec(ft: &FILETIME) -> i32 {
         let t = ((ft.dwHighDateTime as u64) << 32) | (ft.dwLowDateTime as u64);
@@ -370,28 +395,6 @@ mod inner {
         sys
     }
 
-    fn system_time_to_tm(sys: &SYSTEMTIME, tm: &mut Tm) {
-        tm.tm_sec = sys.wSecond as i32;
-        tm.tm_min = sys.wMinute as i32;
-        tm.tm_hour = sys.wHour as i32;
-        tm.tm_mday = sys.wDay as i32;
-        tm.tm_wday = sys.wDayOfWeek as i32;
-        tm.tm_mon = (sys.wMonth - 1) as i32;
-        tm.tm_year = (sys.wYear - 1900) as i32;
-        tm.tm_yday = yday(tm.tm_year, tm.tm_mon + 1, tm.tm_mday);
-
-        fn yday(year: i32, month: i32, day: i32) -> i32 {
-            let leap = if month > 2 {
-                if year % 4 == 0 { 1 } else { 2 }
-            } else {
-                0
-            };
-            let july = if month > 7 { 1 } else { 0 };
-
-            (month - 1) * 30 + month / 2 + (day - 1) - leap + july
-        }
-    }
-
     macro_rules! call {
         ($name:ident($($arg:expr),*)) => {
             if $name($($arg),*) == 0 {
@@ -402,28 +405,23 @@ mod inner {
     }
 
     pub fn time_to_utc_tm(sec: i64, tm: &mut Tm) {
-        let mut out = unsafe { mem::zeroed() };
-        let ft = time_to_file_time(sec);
         unsafe {
-            call!(FileTimeToSystemTime(&ft, &mut out));
+            let mut out = mem::zeroed();
+            if _gmtime64_s( &mut out, &sec) != 0 {
+                panic!("_gmtime64_s failed: {}", io::Error::last_os_error());
+            }
+            tm_to_rust_tm(&out, 0, tm);
         }
-        system_time_to_tm(&out, tm);
-        tm.tm_utcoff = 0;
     }
 
     pub fn time_to_local_tm(sec: i64, tm: &mut Tm) {
-        let ft = time_to_file_time(sec);
         unsafe {
-            let mut utc = mem::zeroed();
-            let mut local = mem::zeroed();
-            call!(FileTimeToSystemTime(&ft, &mut utc));
-            call!(SystemTimeToTzSpecificLocalTime(0 as *const _,
-                                                  &mut utc, &mut local));
-            system_time_to_tm(&local, tm);
-
-            let mut tz = mem::zeroed();
-            GetTimeZoneInformation(&mut tz);
-            tm.tm_utcoff = -tz.Bias * 60;
+            let mut out_local = mem::zeroed();
+            if _localtime64_s(&mut out_local, &sec) != 0 {
+                panic!("_localtime64_s failed: {}", io::Error::last_os_error());
+            }
+            let interpreted_as_gmt = _mkgmtime64(&out_local);
+            tm_to_rust_tm(&out_local, (interpreted_as_gmt - sec) as i32, tm);
         }
     }
 
@@ -432,18 +430,6 @@ mod inner {
             let mut ft = mem::zeroed();
             let sys_time = tm_to_system_time(tm);
             call!(SystemTimeToFileTime(&sys_time, &mut ft));
-            file_time_to_unix_seconds(&ft)
-        }
-    }
-
-    pub fn local_tm_to_time(tm: &Tm) -> i64 {
-        unsafe {
-            let mut ft = mem::zeroed();
-            let mut utc = mem::zeroed();
-            let mut sys_time = tm_to_system_time(tm);
-            call!(TzSpecificLocalTimeToSystemTime(0 as *mut _,
-                                                  &mut sys_time, &mut utc));
-            call!(SystemTimeToFileTime(&utc, &mut ft));
             file_time_to_unix_seconds(&ft)
         }
     }
